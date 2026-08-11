@@ -160,6 +160,14 @@
     <ul id="peers-list"></ul>
     <p class="empty-hint" id="peers-empty">No previous connections yet.</p>
   </div>
+
+  <div class="panel" id="debug-panel">
+    <h2>Debug</h2>
+    <div class="row">
+      <button class="danger" id="reset-state-btn" type="button">Reset Local State</button>
+      <span class="status-line">Clears your identity, saved peers, and transfer history from this browser.</span>
+    </div>
+  </div>
 </div>
 
 <div class="overlay" id="incoming-request-overlay" hidden>
@@ -206,6 +214,8 @@ const LOW_WATER = 4 * 1024 * 1024;
 const CHECKPOINT_CHUNK_INTERVAL = 128;
 const CHECKPOINT_TIME_INTERVAL_MS = 2000;
 const ICE_FAILURE_TIMEOUT_MS = 15000;
+const RATE_WINDOW_MS = 5000;
+const RATE_TICK_MS = 1000;
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -219,6 +229,16 @@ function formatBytes(n) {
   let u = -1;
   do { n /= 1024; u++; } while (n >= 1024 && u < units.length - 1);
   return `${n.toFixed(1)} ${units[u]}`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  seconds = Math.round(seconds);
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m ${seconds % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
 }
 
 async function ensurePermission(handle, mode) {
@@ -526,7 +546,7 @@ const Transfers = {
     const {
       writable, file, awaitingOffer, transferId,
       chunksSinceCheckpoint, lastCheckpointAt, needsResumeGesture, needsReselect,
-      _writeQueue,
+      _writeQueue, _rateHistory, _bytesPerSec,
       ...toStore
     } = record;
     await IDB.put('transfers', toStore);
@@ -534,6 +554,38 @@ const Transfers = {
 
   list() {
     return [...this.byFileId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  },
+
+  logProgress(record, event = 'progress') {
+    const pct = record.fileSize ? ((record.bytesTransferred / record.fileSize) * 100).toFixed(1) : '0.0';
+    const rate = record._bytesPerSec > 0 ? `${formatBytes(record._bytesPerSec)}/s` : 'n/a';
+    console.log(
+      `[transfer:${event}] ${record.direction} "${record.fileName}" — ` +
+      `${formatBytes(record.bytesTransferred)} / ${formatBytes(record.fileSize)} (${pct}%) @ ${rate}`
+    );
+  },
+
+  // Recomputes each in-progress record's throughput from a rolling window of
+  // recent bytesTransferred samples (rather than a single-tick delta) so the
+  // rate stays stable across the send side's bursty, checkpoint-paced acks.
+  tickRates() {
+    const now = Date.now();
+    let anyActive = false;
+    for (const record of this.byFileId.values()) {
+      if (record.status !== 'in-progress') {
+        if (record._rateHistory) { record._rateHistory = null; record._bytesPerSec = 0; }
+        continue;
+      }
+      anyActive = true;
+      record._rateHistory = record._rateHistory || [];
+      record._rateHistory.push({ t: now, bytes: record.bytesTransferred });
+      const cutoff = now - RATE_WINDOW_MS;
+      while (record._rateHistory.length > 1 && record._rateHistory[0].t < cutoff) record._rateHistory.shift();
+      const oldest = record._rateHistory[0];
+      const dtSec = (now - oldest.t) / 1000;
+      record._bytesPerSec = dtSec > 0 ? Math.max(0, record.bytesTransferred - oldest.bytes) / dtSec : 0;
+    }
+    if (anyActive) UI.renderTransfers();
   },
 
   createSendRecord(fileId, peerId, handle, file) {
@@ -732,6 +784,7 @@ const Transfers = {
     const record = fileId && this.byFileId.get(fileId);
     if (!record) return;
     record.bytesTransferred = msg.bytesTransferred;
+    this.logProgress(record, 'ack');
     UI.renderTransfers();
   },
 
@@ -740,7 +793,10 @@ const Transfers = {
     const record = fileId && this.byFileId.get(fileId);
     if (!record) return;
     record.status = 'complete';
+    record._rateHistory = null;
+    record._bytesPerSec = 0;
     await this.persist(record);
+    this.logProgress(record, 'complete');
     UI.renderTransfers();
   },
 
@@ -792,9 +848,13 @@ const Transfers = {
     if (isComplete) {
       RTC.send({ type: 'transfer-complete', transferId: record.transferId });
       record.writable = null;
+      record._rateHistory = null;
+      record._bytesPerSec = 0;
       UI.showToast(`${record.fileName} downloaded successfully.`);
+      this.logProgress(record, 'complete');
     } else {
       record.writable = await record.fileHandle.createWritable({ keepExistingData: true });
+      this.logProgress(record, 'checkpoint');
     }
     UI.renderTransfers();
   },
@@ -815,6 +875,8 @@ const Transfers = {
       record.transferId = null;
       record.awaitingOffer = false;
       record.needsResumeGesture = false;
+      record._rateHistory = null;
+      record._bytesPerSec = 0;
       await this.persist(record);
     }
     this.byTransferId.clear();
@@ -866,6 +928,8 @@ const UI = {
       document.getElementById('chosen-file-name').textContent = `${file.name} (${formatBytes(file.size)})`;
       await Transfers.shareFile(handle);
     });
+
+    document.getElementById('reset-state-btn').addEventListener('click', () => App.resetLocalState());
 
     this.renderPeers();
     this.renderTransfers();
@@ -949,6 +1013,20 @@ const UI = {
     document.getElementById('transfers-empty').hidden = records.length > 0;
   },
 
+  _metaText(record) {
+    const pct = record.fileSize ? Math.min(100, Math.floor((record.bytesTransferred / record.fileSize) * 100)) : 0;
+    if (record.status !== 'in-progress') {
+      return `${formatBytes(record.fileSize)} · ${record.status}`;
+    }
+    let text = `${formatBytes(record.bytesTransferred)} / ${formatBytes(record.fileSize)} (${pct}%)`;
+    if (record._bytesPerSec > 0) {
+      text += ` · ${formatBytes(record._bytesPerSec)}/s`;
+      const remaining = record.fileSize - record.bytesTransferred;
+      text += ` · ETA ${formatDuration(remaining / record._bytesPerSec)}`;
+    }
+    return text;
+  },
+
   _transferRow(record) {
     const isPeerConnected = !!(RTC.dc && RTC.dc.readyState === 'open' && RTC.remotePeerId === record.peerId);
 
@@ -956,7 +1034,7 @@ const UI = {
       document.createTextNode(`${record.direction === 'send' ? '⬆' : '⬇'} ${record.fileName}`),
     ]);
     const meta = el('div', { className: 'transfer-meta' }, [
-      document.createTextNode(`${formatBytes(record.fileSize)} · ${record.status}`),
+      document.createTextNode(this._metaText(record)),
     ]);
     const info = el('div', { className: 'transfer-info' }, [title, meta]);
 
@@ -1030,6 +1108,7 @@ const App = {
 
     await Signaling.connect();
     Signaling.register();
+    setInterval(() => Transfers.tickRates(), RATE_TICK_MS);
   },
 
   async onSessionStart(msg) {
@@ -1073,6 +1152,30 @@ const App = {
     UI.showDisconnected();
     if (Signaling.ws && Signaling.ws.readyState === WebSocket.OPEN) Signaling.register();
     this._tearingDown = false;
+  },
+
+  async resetLocalState() {
+    const confirmed = window.confirm(
+      'This deletes your identity, saved peers, and all transfer history from this browser. ' +
+      'In-progress transfers will be lost. This cannot be undone. Continue?'
+    );
+    if (!confirmed) return;
+
+    RTC.teardown();
+    if (Signaling.ws) { try { Signaling.ws.close(); } catch { /* already closed */ } }
+
+    if (IDB.db) { IDB.db.close(); IDB.db = null; }
+    await new Promise((resolve) => {
+      const req = indexedDB.deleteDatabase('p2p-transfer');
+      req.onsuccess = resolve;
+      req.onerror = resolve;
+      req.onblocked = resolve;
+    });
+
+    localStorage.removeItem('p2p.peerId');
+    localStorage.removeItem('p2p.nickname');
+
+    location.reload();
   },
 };
 
