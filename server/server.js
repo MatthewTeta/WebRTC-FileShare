@@ -7,7 +7,41 @@ import { WebSocketServer } from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_HTML_PATH = path.join(__dirname, '..', 'client', 'index.html');
+
+function loadEnvFile(filePath) {
+  let contents;
+  try {
+    contents = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return;
+  }
+  for (const line of contents.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadEnvFile(path.join(__dirname, '.env'));
+
 const PORT = process.env.PORT || 8087;
+
+// When started under systemd socket activation, the listening socket is
+// already open and inherited as fd 3 (SD_LISTEN_FDS_START) — bind to that
+// instead of asking the OS for a fresh port.
+const usingSocketActivation =
+  Number(process.env.LISTEN_FDS) > 0 &&
+  process.env.LISTEN_PID === String(process.pid);
 
 const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const CODE_LENGTH = 6;
@@ -203,6 +237,12 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat));
 
-server.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-});
+if (usingSocketActivation) {
+  server.listen({ fd: 3 }, () => {
+    console.log('Server listening on systemd-provided socket (fd 3)');
+  });
+} else {
+  server.listen(PORT, () => {
+    console.log(`Server listening on http://localhost:${PORT}`);
+  });
+}

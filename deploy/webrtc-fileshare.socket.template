@@ -1,0 +1,9 @@
+[Unit]
+Description=P2P File Drop signaling server socket
+
+[Socket]
+ListenStream=__PORT__
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

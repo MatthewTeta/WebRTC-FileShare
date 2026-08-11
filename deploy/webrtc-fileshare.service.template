@@ -1,0 +1,20 @@
+[Unit]
+Description=P2P File Drop signaling server
+After=network.target
+Requires=webrtc-fileshare.socket
+
+[Service]
+Type=simple
+ExecStart=__NODE_BIN__ __WORKDIR__/server.js
+WorkingDirectory=__WORKDIR__
+User=__USER__
+Group=__GROUP__
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+# Socket-activated: started on demand by webrtc-fileshare.socket, so no
+# [Install] section here — enable the socket unit, not this one.

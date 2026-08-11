@@ -28,7 +28,12 @@ npm install
 npm start
 ```
 
-This serves the app at `http://localhost:8080`. Open that URL in two
+The port comes from `server/.env` (`PORT=...`; falls back to `8087` if the
+file or variable is absent). Copy `server/.env.example` to `server/.env` and
+edit it to change the port — `server/.env` is gitignored since it's local
+config, not code.
+
+This serves the app at `http://localhost:8097` (see `server/.env`). Open that URL in two
 separate browser profiles (e.g. a normal window and an Incognito window, or
 two different Chrome profiles) to act as the two participants — separate
 profiles matter because each participant's pairing code, peer identity, and
@@ -61,18 +66,53 @@ people on two different networks, the server needs to be reachable over
 the page itself is loaded over `https://`, so no code changes are needed —
 see `client/index.html`'s `Signaling.connect()`).
 
-Two easy ways to get an HTTPS URL in front of `npm start`:
+Two easy ways to get an HTTPS URL in front of the server (adjust the port
+below to match `server/.env`):
 
 - **A small VPS behind [Caddy](https://caddyserver.com/):** a one-line
   Caddyfile gets you automatic TLS:
   ```
   your-domain.com {
-    reverse_proxy localhost:8080
+    reverse_proxy localhost:8097
   }
   ```
-- **Ad-hoc testing with no server of your own:** `ngrok http 8080` or a
+- **Ad-hoc testing with no server of your own:** `ngrok http 8097` or a
   Cloudflare Tunnel gives you an instant HTTPS URL pointed at your local
   process.
+
+### Running as a systemd socket-activated service
+
+For a VPS/always-on box, `deploy/install.sh` installs the server as a
+systemd socket unit instead of a plain long-running service: systemd owns
+port `8097` (from `server/.env`) and starts the Node process on demand on
+the first incoming connection, restarting it automatically if it crashes.
+
+```bash
+cd server && npm install     # install ws once, if you haven't
+sudo ./deploy/install.sh
+```
+
+The script must run with `sudo` (it writes to `/etc/systemd/system` and
+calls `systemctl`) but must be invoked as your normal user (`sudo ...`, not
+logged in as `root`) so the service runs as you rather than as root. It
+reads `PORT` from `server/.env`, locates `node` on your `PATH` (nvm
+installs included), and generates/installs two units from the templates in
+`deploy/`:
+
+- `webrtc-fileshare.socket` — owns the port, `WantedBy=sockets.target`
+- `webrtc-fileshare.service` — runs `node server.js`, started by the socket
+
+Useful commands afterwards:
+
+```bash
+systemctl status webrtc-fileshare.socket webrtc-fileshare.service
+journalctl -u webrtc-fileshare.service -f
+sudo ./deploy/uninstall.sh   # tear it down
+```
+
+If you change the port in `server/.env` later, re-run
+`sudo ./deploy/install.sh` — the port is baked into the socket unit at
+install time, since systemd unit files can't read `.env` files directly.
 
 ## Known limitations (by design, not bugs)
 
