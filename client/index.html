@@ -1,0 +1,1082 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2P File Drop</title>
+<style>
+  :root {
+    --bg: #0f1220;
+    --panel: #171b2e;
+    --panel-2: #1f2440;
+    --border: #2c3255;
+    --text: #e7e9f5;
+    --text-dim: #9aa1c4;
+    --accent: #5b8cff;
+    --accent-2: #34d399;
+    --danger: #f87171;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  #app { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .subtitle { color: var(--text-dim); font-size: 0.9rem; margin: 0 0 24px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 1rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .code-display {
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 1.8rem;
+    letter-spacing: 0.12em;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 18px;
+  }
+  input[type=text] {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 1rem;
+    font-family: inherit;
+  }
+  input[type=text].code-input { font-family: "SFMono-Regular", Consolas, monospace; letter-spacing: 0.1em; text-transform: uppercase; width: 140px; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.danger { background: var(--danger); }
+  .form-error { color: var(--danger); font-size: 0.85rem; min-height: 1.2em; }
+  .status-line { color: var(--text-dim); font-size: 0.9rem; }
+  .status-line.connected { color: var(--accent-2); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.transfer-row, li.peer-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  li.transfer-row:last-child, li.peer-row:last-child { border-bottom: none; }
+  .transfer-info { flex: 1 1 200px; min-width: 0; }
+  .transfer-title { font-weight: 600; overflow-wrap: anywhere; }
+  .transfer-meta { color: var(--text-dim); font-size: 0.82rem; }
+  progress { flex: 1 1 140px; height: 8px; accent-color: var(--accent); }
+  .transfer-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+  .hint { color: var(--text-dim); font-size: 0.78rem; }
+  .empty-hint { color: var(--text-dim); font-size: 0.9rem; }
+  .overlay {
+    position: fixed; inset: 0; background: rgba(5, 6, 15, 0.72);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+    padding: 20px;
+  }
+  .overlay[hidden] { display: none; }
+  .dialog {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 24px; max-width: 380px; width: 100%;
+  }
+  .dialog h3 { margin-top: 0; }
+  .dialog .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+  .unsupported { padding: 60px 24px; text-align: center; font-size: 1.1rem; max-width: 480px; margin: 0 auto; }
+  #toast-container { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 100; }
+  .toast {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; font-size: 0.88rem; max-width: 320px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .nickname-input { background: transparent; border: none; color: var(--text-dim); font-family: inherit; font-size: 0.85rem; border-bottom: 1px dashed var(--border); padding: 2px 0; width: 160px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>P2P File Drop</h1>
+  <p class="subtitle">Direct, serverless file transfer between two browsers. No file ever touches a server.</p>
+
+  <div class="panel" id="identity-panel">
+    <div class="row">
+      <span>You are:</span>
+      <input class="nickname-input" id="nickname-input" type="text" maxlength="40">
+    </div>
+  </div>
+
+  <div class="panel" id="pairing-panel">
+    <h2>Your Code</h2>
+    <div class="row">
+      <div class="code-display" id="own-code">------</div>
+      <button class="secondary" id="copy-code-btn" type="button">Copy</button>
+    </div>
+    <p class="subtitle" style="margin: 10px 0 0;">Share this code with the other person so they can connect to you.</p>
+  </div>
+
+  <div class="panel" id="connect-panel">
+    <h2>Connect</h2>
+    <form id="connect-form" class="row">
+      <input class="code-input" id="connect-code-input" type="text" maxlength="6" placeholder="ABC123" autocomplete="off">
+      <button type="submit" id="connect-submit-btn">Connect</button>
+    </form>
+    <p class="form-error" id="connect-error"></p>
+    <p class="status-line" id="connection-status">Not connected.</p>
+  </div>
+
+  <div class="panel" id="share-panel" hidden>
+    <h2>Share a File</h2>
+    <div class="row">
+      <button id="pick-file-btn" type="button">Choose File&hellip;</button>
+      <span class="status-line" id="chosen-file-name"></span>
+    </div>
+  </div>
+
+  <div class="panel" id="transfers-panel">
+    <h2>Transfers</h2>
+    <ul id="transfers-list"></ul>
+    <p class="empty-hint" id="transfers-empty">No transfers yet.</p>
+  </div>
+
+  <div class="panel" id="peers-panel">
+    <h2>Previous Connections</h2>
+    <ul id="peers-list"></ul>
+    <p class="empty-hint" id="peers-empty">No previous connections yet.</p>
+  </div>
+</div>
+
+<div class="overlay" id="incoming-request-overlay" hidden>
+  <div class="dialog">
+    <h3>Incoming connection request</h3>
+    <p>Someone wants to connect to you. Accept?</p>
+    <div class="actions">
+      <button class="secondary" id="deny-btn" type="button">Deny</button>
+      <button id="accept-btn" type="button">Accept</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="denied-overlay" hidden>
+  <div class="dialog">
+    <h3>Connection denied</h3>
+    <p>The other user declined your connection request.</p>
+    <div class="actions"><button id="denied-ok-btn" type="button">OK</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="ice-failed-overlay" hidden>
+  <div class="dialog">
+    <h3>Could not connect directly</h3>
+    <p>A direct peer-to-peer connection could not be established. This can happen on restrictive networks (e.g. symmetric NAT). No relay server is used, by design, to keep transfers private.</p>
+    <div class="actions"><button id="ice-failed-ok-btn" type="button">OK</button></div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script type="module">
+if (!('showOpenFilePicker' in window) || !('showSaveFilePicker' in window) ||
+    !window.RTCPeerConnection || !window.indexedDB || !window.WebSocket) {
+  document.getElementById('app').innerHTML =
+    '<div class="unsupported">This app requires a recent Chrome or Edge browser &mdash; it relies on the File System Access API, WebRTC, and IndexedDB, which are not available here.</div>';
+  throw new Error('unsupported-browser');
+}
+
+const CHUNK_PAYLOAD_SIZE = 262136; // bytes; + 8 byte header = 262144 (Chromium default DataChannel max message size)
+const CHUNK_HEADER_SIZE = 8;
+const HIGH_WATER = 16 * 1024 * 1024;
+const LOW_WATER = 4 * 1024 * 1024;
+const CHECKPOINT_CHUNK_INTERVAL = 128;
+const CHECKPOINT_TIME_INTERVAL_MS = 2000;
+const ICE_FAILURE_TIMEOUT_MS = 15000;
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let u = -1;
+  do { n /= 1024; u++; } while (n >= 1024 && u < units.length - 1);
+  return `${n.toFixed(1)} ${units[u]}`;
+}
+
+async function ensurePermission(handle, mode) {
+  if ((await handle.queryPermission({ mode })) === 'granted') return true;
+  return (await handle.requestPermission({ mode })) === 'granted';
+}
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'className') node.className = v;
+    else if (k === 'onclick') node.addEventListener('click', v);
+    else if (k in node) node[k] = v;
+    else node.setAttribute(k, v);
+  }
+  for (const child of children) node.append(child);
+  return node;
+}
+
+// ---------------------------------------------------------------- Identity
+const Identity = {
+  peerId: null,
+  nickname: null,
+  init() {
+    let id = localStorage.getItem('p2p.peerId');
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem('p2p.peerId', id);
+    }
+    this.peerId = id;
+    let nickname = localStorage.getItem('p2p.nickname');
+    if (!nickname) {
+      nickname = `Guest-${id.slice(0, 4)}`;
+      localStorage.setItem('p2p.nickname', nickname);
+    }
+    this.nickname = nickname;
+  },
+  setNickname(nickname) {
+    this.nickname = nickname || this.nickname;
+    localStorage.setItem('p2p.nickname', this.nickname);
+  },
+};
+
+// --------------------------------------------------------------------- IDB
+const IDB = {
+  db: null,
+  open() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('p2p-transfer', 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        const peers = db.createObjectStore('peers', { keyPath: 'peerId' });
+        peers.createIndex('by_lastConnectedAt', 'lastConnectedAt');
+        const transfers = db.createObjectStore('transfers', { keyPath: 'fileId' });
+        transfers.createIndex('by_peerId', 'peerId');
+        transfers.createIndex('by_status', 'status');
+      };
+      req.onsuccess = () => { this.db = req.result; resolve(this.db); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  store(name, mode) {
+    return this.db.transaction(name, mode).objectStore(name);
+  },
+  put(name, value) {
+    return new Promise((resolve, reject) => {
+      const req = this.store(name, 'readwrite').put(value);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  getAll(name) {
+    return new Promise((resolve, reject) => {
+      const req = this.store(name, 'readonly').getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  delete(name, key) {
+    return new Promise((resolve, reject) => {
+      const req = this.store(name, 'readwrite').delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+};
+
+// ---------------------------------------------------------------- Protocol
+const Protocol = {
+  encodeChunk(transferId, chunkIndex, payloadBytes) {
+    const msg = new Uint8Array(CHUNK_HEADER_SIZE + payloadBytes.length);
+    const view = new DataView(msg.buffer);
+    view.setUint32(0, transferId, true);
+    view.setUint32(4, chunkIndex, true);
+    msg.set(payloadBytes, CHUNK_HEADER_SIZE);
+    return msg;
+  },
+  decodeChunk(arrayBuffer) {
+    const view = new DataView(arrayBuffer);
+    const transferId = view.getUint32(0, true);
+    const chunkIndex = view.getUint32(4, true);
+    const payload = new Uint8Array(arrayBuffer, CHUNK_HEADER_SIZE);
+    return { transferId, chunkIndex, payload };
+  },
+  makeBitmap(totalChunks) {
+    return new Uint8Array(Math.ceil(totalChunks / 8));
+  },
+  isChunkSet(bitmap, index) {
+    return (bitmap[index >> 3] >> (index & 7)) & 1;
+  },
+  setChunk(bitmap, index) {
+    bitmap[index >> 3] |= (1 << (index & 7));
+  },
+  countSet(bitmap, totalChunks) {
+    let count = 0;
+    for (let i = 0; i < totalChunks; i++) if (this.isChunkSet(bitmap, i)) count++;
+    return count;
+  },
+  getMissingRanges(bitmap, totalChunks) {
+    const ranges = [];
+    let start = null;
+    for (let i = 0; i < totalChunks; i++) {
+      const bit = this.isChunkSet(bitmap, i);
+      if (!bit && start === null) start = i;
+      if (bit && start !== null) { ranges.push([start, i]); start = null; }
+    }
+    if (start !== null) ranges.push([start, totalChunks]);
+    return ranges;
+  },
+  *expandRanges(ranges) {
+    for (const [s, e] of ranges) for (let i = s; i < e; i++) yield i;
+  },
+};
+
+// --------------------------------------------------------------- Signaling
+const Signaling = {
+  ws: null,
+  handlers: {},
+  connect() {
+    return new Promise((resolve, reject) => {
+      const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+      this.ws = new WebSocket(wsUrl);
+      this.ws.onopen = () => resolve();
+      this.ws.onerror = (e) => reject(e);
+      this.ws.onmessage = (e) => this._dispatch(JSON.parse(e.data));
+      this.ws.onclose = () => this._dispatch({ type: 'closed' });
+    });
+  },
+  on(type, handler) { this.handlers[type] = handler; },
+  _dispatch(msg) { const h = this.handlers[msg.type]; if (h) h(msg); },
+  send(msg) { this.ws.send(JSON.stringify(msg)); },
+  register() { this.send({ type: 'register' }); },
+  connectRequest(code) { this.send({ type: 'connect-request', code }); },
+  connectResponse(requestId, accept) { this.send({ type: 'connect-response', requestId, accept }); },
+  signal(sessionId, payload) { this.send({ type: 'signal', sessionId, payload }); },
+};
+
+// -------------------------------------------------------------------- RTC
+const RTC = {
+  pc: null,
+  dc: null,
+  sessionId: null,
+  remotePeerId: null,
+  remoteNickname: null,
+  handlers: {},
+  _pendingCandidates: [],
+
+  on(type, handler) { this.handlers[type] = handler; },
+  _emit(type, ...args) { const h = this.handlers[type]; if (h) h(...args); },
+
+  async startAsOfferer(sessionId) {
+    this.sessionId = sessionId;
+    this._pendingCandidates = [];
+    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    this._wirePc();
+    this.dc = this.pc.createDataChannel('transfer', { ordered: true });
+    this._wireDc();
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    Signaling.signal(sessionId, { kind: 'offer', sdp: this.pc.localDescription.sdp });
+  },
+
+  startAsAnswerer(sessionId) {
+    this.sessionId = sessionId;
+    this._pendingCandidates = [];
+    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    this._wirePc();
+    this.pc.ondatachannel = (e) => { this.dc = e.channel; this._wireDc(); };
+  },
+
+  async handleSignal(payload) {
+    if (!this.pc) return;
+    if (payload.kind === 'offer') {
+      await this.pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
+      await this._flushCandidates();
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+      Signaling.signal(this.sessionId, { kind: 'answer', sdp: this.pc.localDescription.sdp });
+    } else if (payload.kind === 'answer') {
+      await this.pc.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
+      await this._flushCandidates();
+    } else if (payload.kind === 'ice-candidate') {
+      if (this.pc.remoteDescription) {
+        try { await this.pc.addIceCandidate(payload.candidate); } catch (err) { console.warn('addIceCandidate failed', err); }
+      } else {
+        this._pendingCandidates.push(payload.candidate);
+      }
+    }
+  },
+
+  async _flushCandidates() {
+    for (const c of this._pendingCandidates) {
+      try { await this.pc.addIceCandidate(c); } catch (err) { console.warn('addIceCandidate failed', err); }
+    }
+    this._pendingCandidates = [];
+  },
+
+  _wirePc() {
+    this.pc.onicecandidate = (e) => {
+      if (e.candidate) Signaling.signal(this.sessionId, { kind: 'ice-candidate', candidate: e.candidate });
+    };
+    this.pc.onconnectionstatechange = () => this._emit('statechange', this.pc.connectionState);
+    this.pc.oniceconnectionstatechange = () => this._emit('icestatechange', this.pc.iceConnectionState);
+  },
+
+  _wireDc() {
+    this.dc.binaryType = 'arraybuffer';
+    this.dc.bufferedAmountLowThreshold = LOW_WATER;
+    this.dc.onopen = () => {
+      this.send({ type: 'hello', peerId: Identity.peerId, nickname: Identity.nickname });
+      this._emit('open');
+    };
+    this.dc.onclose = () => this._emit('close');
+    this.dc.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'hello') {
+          this.remotePeerId = msg.peerId;
+          this.remoteNickname = msg.nickname;
+          this._emit('hello', msg.peerId, msg.nickname);
+        } else {
+          this._emit('control', msg);
+        }
+      } else {
+        this._emit('binary', e.data);
+      }
+    };
+  },
+
+  send(msg) { if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(msg)); },
+  sendBinary(bytes) { this.dc.send(bytes); },
+  bufferedAmount() { return this.dc ? this.dc.bufferedAmount : 0; },
+  waitForLowBuffer() { return new Promise((resolve) => this.dc.addEventListener('bufferedamountlow', resolve, { once: true })); },
+
+  teardown() {
+    if (this.dc) { try { this.dc.close(); } catch { /* already closed */ } }
+    if (this.pc) { try { this.pc.close(); } catch { /* already closed */ } }
+    this.pc = null; this.dc = null; this.sessionId = null;
+    this.remotePeerId = null; this.remoteNickname = null;
+  },
+};
+
+// ------------------------------------------------------------------ Peers
+const Peers = {
+  byId: new Map(),
+  async loadFromIDB() {
+    for (const row of await IDB.getAll('peers')) this.byId.set(row.peerId, row);
+  },
+  async upsert(peerId, nickname) {
+    const now = Date.now();
+    let row = this.byId.get(peerId);
+    if (!row) row = { peerId, nickname, firstConnectedAt: now, lastConnectedAt: now };
+    else { row.nickname = nickname; row.lastConnectedAt = now; }
+    this.byId.set(peerId, row);
+    await IDB.put('peers', row);
+  },
+  list() {
+    return [...this.byId.values()].sort((a, b) => b.lastConnectedAt - a.lastConnectedAt);
+  },
+};
+
+// --------------------------------------------------------------- Transfers
+let transferIdCounter = 0;
+
+const Transfers = {
+  byFileId: new Map(),
+  byTransferId: new Map(),
+
+  async loadFromIDB() {
+    for (const row of await IDB.getAll('transfers')) {
+      row.transferId = null;
+      row.awaitingOffer = false;
+      row.needsResumeGesture = false;
+      row.needsReselect = null;
+      row.writable = null;
+      row.file = null;
+      row.chunksSinceCheckpoint = 0;
+      row.lastCheckpointAt = 0;
+      this.byFileId.set(row.fileId, row);
+    }
+  },
+
+  async persist(record) {
+    record.updatedAt = Date.now();
+    const {
+      writable, file, awaitingOffer, transferId,
+      chunksSinceCheckpoint, lastCheckpointAt, needsResumeGesture, needsReselect,
+      _writeQueue,
+      ...toStore
+    } = record;
+    await IDB.put('transfers', toStore);
+  },
+
+  list() {
+    return [...this.byFileId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  },
+
+  createSendRecord(fileId, peerId, handle, file) {
+    const record = {
+      fileId, peerId, direction: 'send',
+      fileName: file.name, fileSize: file.size, mimeType: file.type || 'application/octet-stream',
+      chunkSize: CHUNK_PAYLOAD_SIZE, totalChunks: Math.ceil(file.size / CHUNK_PAYLOAD_SIZE) || 1,
+      bytesTransferred: 0, status: 'offered',
+      fileHandle: handle, createdAt: Date.now(), updatedAt: Date.now(),
+      transferId: null, file, writable: null, awaitingOffer: false,
+      needsResumeGesture: false, needsReselect: null,
+      chunksSinceCheckpoint: 0, lastCheckpointAt: 0,
+    };
+    this.byFileId.set(fileId, record);
+    return record;
+  },
+
+  createOrUpdateReceiveRecord(msg, peerId) {
+    let record = this.byFileId.get(msg.fileId);
+    if (!record) {
+      record = {
+        fileId: msg.fileId, peerId, direction: 'receive',
+        fileName: msg.name, fileSize: msg.size, mimeType: msg.mimeType,
+        chunkSize: msg.chunkSize, totalChunks: msg.totalChunks,
+        receivedBitmap: Protocol.makeBitmap(msg.totalChunks),
+        bytesTransferred: 0, status: 'offered',
+        fileHandle: null, createdAt: Date.now(), updatedAt: Date.now(),
+        transferId: null, writable: null, awaitingOffer: false,
+        needsResumeGesture: false, needsReselect: null,
+        chunksSinceCheckpoint: 0, lastCheckpointAt: 0,
+      };
+      this.byFileId.set(record.fileId, record);
+    } else {
+      record.peerId = peerId;
+    }
+    record.transferId = msg.transferId;
+    this.byTransferId.set(msg.transferId, record.fileId);
+    return record;
+  },
+
+  reofferSend(record) {
+    record.transferId = ++transferIdCounter;
+    this.byTransferId.set(record.transferId, record.fileId);
+    RTC.send({
+      type: 'file-offer', fileId: record.fileId, transferId: record.transferId,
+      name: record.fileName, size: record.fileSize, mimeType: record.mimeType,
+      chunkSize: record.chunkSize, totalChunks: record.totalChunks,
+    });
+  },
+
+  async shareFile(handle) {
+    const file = await handle.getFile();
+    const fileId = crypto.randomUUID();
+    const record = this.createSendRecord(fileId, RTC.remotePeerId, handle, file);
+    this.reofferSend(record);
+    await this.persist(record);
+    UI.renderTransfers();
+  },
+
+  // ---- receive side ----
+  async beginOrResumeDownload(record) {
+    if (!record.fileHandle) {
+      try { record.fileHandle = await window.showSaveFilePicker({ suggestedName: record.fileName }); }
+      catch { return; }
+    } else {
+      const granted = await ensurePermission(record.fileHandle, 'readwrite');
+      if (!granted) {
+        record.needsReselect = 'save';
+        UI.renderTransfers();
+        return;
+      }
+    }
+    await this._openWritableAndRequest(record);
+  },
+
+  async reselectDestination(record) {
+    try { record.fileHandle = await window.showSaveFilePicker({ suggestedName: record.fileName }); }
+    catch { return; }
+    record.needsReselect = null;
+    await this._openWritableAndRequest(record);
+  },
+
+  async _openWritableAndRequest(record) {
+    record.writable = await record.fileHandle.createWritable({ keepExistingData: true });
+    record.status = 'in-progress';
+    record.lastCheckpointAt = Date.now();
+    await this.persist(record);
+    UI.renderTransfers();
+    const ranges = Protocol.getMissingRanges(record.receivedBitmap, record.totalChunks);
+    RTC.send({ type: 'chunk-request', transferId: record.transferId, ranges });
+  },
+
+  async startResume(record) {
+    if (record.transferId != null) {
+      await this.beginOrResumeDownload(record);
+    } else {
+      record.awaitingOffer = true;
+      UI.renderTransfers();
+      RTC.send({ type: 'request-offer', fileId: record.fileId });
+    }
+  },
+
+  // ---- send side ----
+  async resumeSharing(record) {
+    const granted = await ensurePermission(record.fileHandle, 'read');
+    if (!granted) {
+      record.needsReselect = 'open';
+      UI.renderTransfers();
+      return;
+    }
+    record.file = await record.fileHandle.getFile();
+    await this._afterFileReady(record);
+  },
+
+  async reselectSource(record) {
+    let handle, file;
+    try {
+      [handle] = await window.showOpenFilePicker();
+      file = await handle.getFile();
+    } catch { return; }
+    if (file.size !== record.fileSize) {
+      UI.showToast('Selected file size does not match the original — please pick the same file.');
+      return;
+    }
+    record.fileHandle = handle;
+    record.file = file;
+    record.needsReselect = null;
+    await this._afterFileReady(record);
+  },
+
+  async _afterFileReady(record) {
+    record.needsResumeGesture = false;
+    this.reofferSend(record);
+    record.status = 'in-progress';
+    await this.persist(record);
+    UI.renderTransfers();
+  },
+
+  // ---- incoming control/binary dispatch ----
+  handleControl(msg) {
+    switch (msg.type) {
+      case 'file-offer': this.onFileOffer(msg); break;
+      case 'chunk-request': this.onChunkRequest(msg); break;
+      case 'request-offer': this.onRequestOffer(msg); break;
+      case 'progress': this.onProgress(msg); break;
+      case 'transfer-complete': this.onTransferComplete(msg); break;
+      default: break;
+    }
+  },
+
+  async onFileOffer(msg) {
+    const record = this.createOrUpdateReceiveRecord(msg, RTC.remotePeerId);
+    await this.persist(record);
+    UI.renderTransfers();
+    if (record.awaitingOffer) {
+      record.awaitingOffer = false;
+      await this.beginOrResumeDownload(record);
+    }
+  },
+
+  async onChunkRequest(msg) {
+    const fileId = this.byTransferId.get(msg.transferId);
+    const record = fileId && this.byFileId.get(fileId);
+    if (!record || record.direction !== 'send' || !record.file) return;
+    record.status = 'in-progress';
+    await this.persist(record);
+    UI.renderTransfers();
+    await this.pumpChunks(record, msg.ranges);
+  },
+
+  async pumpChunks(record, ranges) {
+    for (const idx of Protocol.expandRanges(ranges)) {
+      if (record.transferId == null) return; // connection torn down mid-pump
+      if (RTC.bufferedAmount() > HIGH_WATER) await RTC.waitForLowBuffer();
+      const start = idx * record.chunkSize;
+      const end = Math.min(start + record.chunkSize, record.fileSize);
+      const bytes = new Uint8Array(await record.file.slice(start, end).arrayBuffer());
+      RTC.sendBinary(Protocol.encodeChunk(record.transferId, idx, bytes));
+    }
+  },
+
+  onRequestOffer(msg) {
+    const record = this.byFileId.get(msg.fileId);
+    if (!record || record.direction !== 'send') return;
+    if (record.file && record.fileHandle) {
+      this.reofferSend(record);
+      UI.renderTransfers();
+    } else {
+      record.needsResumeGesture = true;
+      UI.renderTransfers();
+    }
+  },
+
+  onProgress(msg) {
+    const fileId = this.byTransferId.get(msg.transferId);
+    const record = fileId && this.byFileId.get(fileId);
+    if (!record) return;
+    record.bytesTransferred = msg.bytesTransferred;
+    UI.renderTransfers();
+  },
+
+  async onTransferComplete(msg) {
+    const fileId = this.byTransferId.get(msg.transferId);
+    const record = fileId && this.byFileId.get(fileId);
+    if (!record) return;
+    record.status = 'complete';
+    await this.persist(record);
+    UI.renderTransfers();
+  },
+
+  async handleBinary(buf) {
+    const { transferId, chunkIndex, payload } = Protocol.decodeChunk(buf);
+    const fileId = this.byTransferId.get(transferId);
+    const record = fileId && this.byFileId.get(fileId);
+    if (!record || record.direction !== 'receive' || !record.writable) return;
+    // DataChannel messages arrive as separate events; without this chain, a
+    // fast-arriving chunk could start writing (or a checkpoint could close())
+    // before the previous chunk's write settles. Queue per record so writes
+    // and checkpoint close/reopen cycles never overlap on the same stream.
+    record._writeQueue = (record._writeQueue || Promise.resolve()).then(
+      () => this._processChunk(record, chunkIndex, payload)
+    );
+    await record._writeQueue;
+  },
+
+  async _processChunk(record, chunkIndex, payload) {
+    if (!record.writable) return; // torn down (disconnect) while queued
+    await record.writable.write({ type: 'write', position: chunkIndex * record.chunkSize, data: payload });
+    if (!Protocol.isChunkSet(record.receivedBitmap, chunkIndex)) {
+      Protocol.setChunk(record.receivedBitmap, chunkIndex);
+      record.bytesTransferred = Math.min(record.bytesTransferred + payload.byteLength, record.fileSize);
+      record.chunksSinceCheckpoint++;
+    }
+    UI.renderTransfers();
+    await this.maybeCheckpoint(record);
+  },
+
+  async maybeCheckpoint(record) {
+    const now = Date.now();
+    const isComplete = Protocol.countSet(record.receivedBitmap, record.totalChunks) === record.totalChunks;
+    const dueByCount = record.chunksSinceCheckpoint >= CHECKPOINT_CHUNK_INTERVAL;
+    const dueByTime = record.chunksSinceCheckpoint > 0 && (now - record.lastCheckpointAt) >= CHECKPOINT_TIME_INTERVAL_MS;
+    if (!isComplete && !dueByCount && !dueByTime) return;
+
+    await record.writable.close();
+    record.lastCheckpointAt = now;
+    record.chunksSinceCheckpoint = 0;
+    record.status = isComplete ? 'complete' : 'in-progress';
+    await this.persist(record);
+    RTC.send({
+      type: 'progress', transferId: record.transferId,
+      receivedChunks: Protocol.countSet(record.receivedBitmap, record.totalChunks),
+      bytesTransferred: record.bytesTransferred,
+    });
+
+    if (isComplete) {
+      RTC.send({ type: 'transfer-complete', transferId: record.transferId });
+      record.writable = null;
+      UI.showToast(`${record.fileName} downloaded successfully.`);
+    } else {
+      record.writable = await record.fileHandle.createWritable({ keepExistingData: true });
+    }
+    UI.renderTransfers();
+  },
+
+  async handleDisconnect(peerId) {
+    for (const record of this.byFileId.values()) {
+      if (record.peerId !== peerId) continue;
+      if (record.direction === 'receive' && record.writable) {
+        // Route through the same queue as chunk writes so this close() can't
+        // race an in-flight write() from a chunk that was still processing.
+        record._writeQueue = (record._writeQueue || Promise.resolve()).then(async () => {
+          try { await record.writable.close(); } catch { /* best effort */ }
+          record.writable = null;
+        });
+        await record._writeQueue;
+      }
+      if (record.status === 'in-progress' || record.status === 'offered') record.status = 'interrupted';
+      record.transferId = null;
+      record.awaitingOffer = false;
+      record.needsResumeGesture = false;
+      await this.persist(record);
+    }
+    this.byTransferId.clear();
+  },
+};
+
+// -------------------------------------------------------------------- UI
+const UI = {
+  currentRequestId: null,
+
+  init() {
+    document.getElementById('nickname-input').value = Identity.nickname;
+    document.getElementById('nickname-input').addEventListener('change', (e) => {
+      Identity.setNickname(e.target.value.trim());
+    });
+
+    document.getElementById('copy-code-btn').addEventListener('click', () => {
+      const code = document.getElementById('own-code').textContent;
+      navigator.clipboard?.writeText(code).catch(() => {});
+    });
+
+    document.getElementById('connect-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const input = document.getElementById('connect-code-input');
+      const code = input.value.trim().toUpperCase();
+      if (!code) return;
+      document.getElementById('connect-error').textContent = '';
+      document.getElementById('connect-submit-btn').disabled = true;
+      document.getElementById('connection-status').textContent = 'Connecting… waiting for the other user to accept.';
+      Signaling.connectRequest(code);
+    });
+
+    document.getElementById('accept-btn').addEventListener('click', () => {
+      Signaling.connectResponse(this.currentRequestId, true);
+      this.hideIncomingRequest();
+    });
+    document.getElementById('deny-btn').addEventListener('click', () => {
+      Signaling.connectResponse(this.currentRequestId, false);
+      this.hideIncomingRequest();
+    });
+    document.getElementById('denied-ok-btn').addEventListener('click', () => this.hideDenied());
+    document.getElementById('ice-failed-ok-btn').addEventListener('click', () => this.hideIceFailed());
+
+    document.getElementById('pick-file-btn').addEventListener('click', async () => {
+      let handle;
+      try { [handle] = await window.showOpenFilePicker(); }
+      catch { return; }
+      const file = await handle.getFile();
+      document.getElementById('chosen-file-name').textContent = `${file.name} (${formatBytes(file.size)})`;
+      await Transfers.shareFile(handle);
+    });
+
+    this.renderPeers();
+    this.renderTransfers();
+  },
+
+  showCode(code) { document.getElementById('own-code').textContent = code; },
+
+  showConnectError(reason) {
+    const messages = {
+      'invalid-code': 'Invalid or expired code.',
+      'busy': 'That user already has a pending or active connection.',
+    };
+    document.getElementById('connect-error').textContent = messages[reason] || 'Could not connect.';
+    document.getElementById('connect-submit-btn').disabled = false;
+    document.getElementById('connection-status').textContent = 'Not connected.';
+  },
+
+  showIncomingRequest(requestId) {
+    this.currentRequestId = requestId;
+    document.getElementById('incoming-request-overlay').hidden = false;
+  },
+  hideIncomingRequest() {
+    document.getElementById('incoming-request-overlay').hidden = true;
+    this.currentRequestId = null;
+  },
+
+  showDenied() { document.getElementById('denied-overlay').hidden = false; },
+  hideDenied() {
+    document.getElementById('denied-overlay').hidden = true;
+    document.getElementById('connect-submit-btn').disabled = false;
+    document.getElementById('connection-status').textContent = 'Not connected.';
+  },
+
+  showIceFailed() { document.getElementById('ice-failed-overlay').hidden = false; },
+  hideIceFailed() {
+    document.getElementById('ice-failed-overlay').hidden = true;
+    document.getElementById('connect-submit-btn').disabled = false;
+    document.getElementById('connection-status').textContent = 'Not connected.';
+  },
+
+  showConnected(nickname) {
+    document.getElementById('connect-submit-btn').disabled = false;
+    document.getElementById('connect-code-input').value = '';
+    const status = document.getElementById('connection-status');
+    status.textContent = `Connected to ${nickname}.`;
+    status.classList.add('connected');
+    document.getElementById('share-panel').hidden = false;
+  },
+
+  showDisconnected() {
+    const status = document.getElementById('connection-status');
+    status.textContent = 'Not connected.';
+    status.classList.remove('connected');
+    document.getElementById('share-panel').hidden = true;
+    document.getElementById('chosen-file-name').textContent = '';
+  },
+
+  showToast(text) {
+    const toast = el('div', { className: 'toast' }, [document.createTextNode(text)]);
+    document.getElementById('toast-container').append(toast);
+    setTimeout(() => toast.remove(), 5000);
+  },
+
+  renderPeers() {
+    const list = document.getElementById('peers-list');
+    const peers = Peers.list();
+    list.replaceChildren(...peers.map((p) => {
+      const title = el('div', { className: 'transfer-title' }, [document.createTextNode(p.nickname)]);
+      const meta = el('div', { className: 'transfer-meta' }, [
+        document.createTextNode(`Last connected ${new Date(p.lastConnectedAt).toLocaleString()}`),
+      ]);
+      return el('li', { className: 'peer-row' }, [el('div', { className: 'transfer-info' }, [title, meta])]);
+    }));
+    document.getElementById('peers-empty').hidden = peers.length > 0;
+  },
+
+  renderTransfers() {
+    const list = document.getElementById('transfers-list');
+    const records = Transfers.list();
+    list.replaceChildren(...records.map((r) => this._transferRow(r)));
+    document.getElementById('transfers-empty').hidden = records.length > 0;
+  },
+
+  _transferRow(record) {
+    const isPeerConnected = !!(RTC.dc && RTC.dc.readyState === 'open' && RTC.remotePeerId === record.peerId);
+
+    const title = el('div', { className: 'transfer-title' }, [
+      document.createTextNode(`${record.direction === 'send' ? '⬆' : '⬇'} ${record.fileName}`),
+    ]);
+    const meta = el('div', { className: 'transfer-meta' }, [
+      document.createTextNode(`${formatBytes(record.fileSize)} · ${record.status}`),
+    ]);
+    const info = el('div', { className: 'transfer-info' }, [title, meta]);
+
+    const progress = el('progress', { max: record.fileSize, value: record.bytesTransferred || 0 });
+
+    const actions = el('div', { className: 'transfer-actions' });
+    let label = null;
+    let onClick = null;
+    let disabled = false;
+
+    if (record.direction === 'receive') {
+      if (record.needsReselect === 'save') {
+        label = 'Re-select Save Location';
+        onClick = () => Transfers.reselectDestination(record);
+      } else if (record.status === 'offered') {
+        label = 'Download';
+        onClick = () => Transfers.beginOrResumeDownload(record);
+      } else if (record.status === 'interrupted') {
+        label = record.awaitingOffer ? 'Waiting for peer…' : 'Resume';
+        onClick = () => Transfers.startResume(record);
+        disabled = record.awaitingOffer;
+      }
+    } else {
+      if (record.needsReselect === 'open') {
+        label = 'Re-select File';
+        onClick = () => Transfers.reselectSource(record);
+      } else if (record.status === 'interrupted' || record.needsResumeGesture) {
+        label = 'Resume Sharing';
+        onClick = () => Transfers.resumeSharing(record);
+      }
+    }
+
+    if (label) {
+      const btn = el('button', { onclick: onClick, disabled: disabled || !isPeerConnected }, [document.createTextNode(label)]);
+      actions.append(btn);
+      if (!isPeerConnected) actions.append(el('span', { className: 'hint' }, [document.createTextNode('reconnect to enable')]));
+    }
+
+    return el('li', { className: 'transfer-row' }, [info, progress, actions]);
+  },
+};
+
+// ------------------------------------------------------------------- App
+const App = {
+  iceTimeout: null,
+  _tearingDown: false,
+
+  async init() {
+    Identity.init();
+    await IDB.open();
+    await Transfers.loadFromIDB();
+    await Peers.loadFromIDB();
+    UI.init();
+
+    Signaling.on('registered', (msg) => UI.showCode(msg.code));
+    Signaling.on('connect-error', (msg) => UI.showConnectError(msg.reason));
+    Signaling.on('incoming-connect-request', (msg) => UI.showIncomingRequest(msg.requestId));
+    Signaling.on('connect-denied', () => UI.showDenied());
+    Signaling.on('session-start', (msg) => this.onSessionStart(msg));
+    Signaling.on('signal', (msg) => RTC.handleSignal(msg.payload));
+    Signaling.on('peer-disconnected', () => this.onPeerDisconnected());
+    Signaling.on('closed', () => UI.showToast('Lost connection to the signaling server. Reload the page to reconnect.'));
+
+    RTC.on('open', () => this.onRtcOpen());
+    RTC.on('hello', (peerId, nickname) => this.onHello(peerId, nickname));
+    RTC.on('control', (msg) => Transfers.handleControl(msg));
+    RTC.on('binary', (buf) => Transfers.handleBinary(buf));
+    RTC.on('statechange', (state) => this.onRtcStateChange(state));
+    RTC.on('icestatechange', (state) => this.onIceStateChange(state));
+    RTC.on('close', () => this.onPeerDisconnected());
+
+    await Signaling.connect();
+    Signaling.register();
+  },
+
+  async onSessionStart(msg) {
+    this._tearingDown = false;
+    clearTimeout(this.iceTimeout);
+    this.iceTimeout = setTimeout(() => UI.showIceFailed(), ICE_FAILURE_TIMEOUT_MS);
+    if (msg.role === 'offerer') await RTC.startAsOfferer(msg.sessionId);
+    else RTC.startAsAnswerer(msg.sessionId);
+  },
+
+  onRtcOpen() {
+    clearTimeout(this.iceTimeout);
+  },
+
+  async onHello(peerId, nickname) {
+    await Peers.upsert(peerId, nickname);
+    UI.renderPeers();
+    UI.showConnected(nickname);
+    UI.renderTransfers();
+  },
+
+  onRtcStateChange(state) {
+    if (state === 'connected') clearTimeout(this.iceTimeout);
+    if (state === 'disconnected' || state === 'failed' || state === 'closed') this.onPeerDisconnected();
+  },
+
+  onIceStateChange(state) {
+    if (state === 'connected' || state === 'completed') clearTimeout(this.iceTimeout);
+  },
+
+  async onPeerDisconnected() {
+    if (this._tearingDown) return;
+    this._tearingDown = true;
+    clearTimeout(this.iceTimeout);
+    const peerId = RTC.remotePeerId;
+    if (peerId) {
+      await Transfers.handleDisconnect(peerId);
+      UI.renderTransfers();
+    }
+    RTC.teardown();
+    UI.showDisconnected();
+    if (Signaling.ws && Signaling.ws.readyState === WebSocket.OPEN) Signaling.register();
+    this._tearingDown = false;
+  },
+};
+
+App.init();
+</script>
+</body>
+</html>
