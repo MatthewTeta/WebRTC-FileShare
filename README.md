@@ -127,11 +127,20 @@ install time, since systemd unit files can't read `.env` files directly.
   that easier (you know who you were talking to and what you were
   transferring), not a live reconnect mechanism.
 - **Chrome/Edge only**, no fallback for other browsers.
-- **~32 MB / 2s worst-case data loss on an ungraceful crash** (tab killed via
-  Task Manager, power loss). Graceful disconnects (closing the tab, losing
-  the peer connection) checkpoint immediately with no loss beyond that
-  point. This trade-off avoids constantly flushing to disk on every single
-  256 KB chunk.
+- **The whole attempt is lost on an ungraceful crash** (tab killed via Task
+  Manager, power loss) — the destination file is only closed/finalized once,
+  when the transfer actually completes or a disconnect is detected, not on
+  a periodic checkpoint. Closing and reopening a writable with
+  `keepExistingData: true` re-copies the *entire* existing file into a
+  fresh swap file, so checkpointing periodically turned every download into
+  O(bytes²) of copying and left a second full-size copy of the file on disk
+  for the duration of every checkpoint. Graceful disconnects (closing the
+  tab, losing the peer connection) still close and persist immediately, so
+  Resume only ever replays the current attempt, not the whole file.
+- **Only one tab per identity.** A second tab sharing the same local state
+  (same browser profile) is blocked with a message rather than allowed to
+  race the first tab over the same peer connection and transfer records —
+  enforced with an exclusive Web Locks API mutex keyed by peer ID.
 - **No cryptographic whole-file integrity check.** WebRTC's SCTP transport
   already carries a per-message checksum, which is why this wasn't deemed
   necessary for the MVP.

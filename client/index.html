@@ -197,13 +197,21 @@
   </div>
 </div>
 
+<div class="overlay" id="tab-lock-blocked-overlay" hidden>
+  <div class="dialog">
+    <h3>Already open in another tab</h3>
+    <p>This identity is already active in another tab or window. Two tabs sharing the same local state would fight over the same peer connection and transfer history. Close the other tab, then try again.</p>
+    <div class="actions"><button id="tab-lock-retry-btn" type="button">Try Again</button></div>
+  </div>
+</div>
+
 <div id="toast-container"></div>
 
 <script type="module">
 if (!('showOpenFilePicker' in window) || !('showSaveFilePicker' in window) ||
-    !window.RTCPeerConnection || !window.indexedDB || !window.WebSocket) {
+    !window.RTCPeerConnection || !window.indexedDB || !window.WebSocket || !navigator.locks) {
   document.getElementById('app').innerHTML =
-    '<div class="unsupported">This app requires a recent Chrome or Edge browser &mdash; it relies on the File System Access API, WebRTC, and IndexedDB, which are not available here.</div>';
+    '<div class="unsupported">This app requires a recent Chrome or Edge browser &mdash; it relies on the File System Access API, WebRTC, IndexedDB, and the Web Locks API, which are not available here.</div>';
   throw new Error('unsupported-browser');
 }
 
@@ -211,8 +219,6 @@ const CHUNK_PAYLOAD_SIZE = 262136; // bytes; + 8 byte header = 262144 (Chromium 
 const CHUNK_HEADER_SIZE = 8;
 const HIGH_WATER = 16 * 1024 * 1024;
 const LOW_WATER = 4 * 1024 * 1024;
-const CHECKPOINT_CHUNK_INTERVAL = 128;
-const CHECKPOINT_TIME_INTERVAL_MS = 2000;
 const ICE_FAILURE_TIMEOUT_MS = 15000;
 const RATE_WINDOW_MS = 5000;
 const RATE_TICK_MS = 1000;
@@ -244,6 +250,25 @@ function formatDuration(seconds) {
 async function ensurePermission(handle, mode) {
   if ((await handle.queryPermission({ mode })) === 'granted') return true;
   return (await handle.requestPermission({ mode })) === 'granted';
+}
+
+// Two tabs sharing the same identity would both register with the
+// signaling server, both hold their own copy of IndexedDB state in memory,
+// and stomp on each other's peer connection and transfer records. The Web
+// Locks API gives an exclusive, per-origin mutex with no polling and no
+// manual release: `ifAvailable: true` resolves the callback with `null`
+// instantly if another tab already holds it, and whatever the callback
+// returns keeps the lock held until that promise settles -- returning one
+// that never resolves holds it for this tab's whole lifetime; the browser
+// releases it automatically on tab close or navigation.
+function acquireTabLock(lockName) {
+  return new Promise((resolveAcquired) => {
+    navigator.locks.request(lockName, { mode: 'exclusive', ifAvailable: true }, (lock) => {
+      if (!lock) { resolveAcquired(false); return; }
+      resolveAcquired(true);
+      return new Promise(() => { /* held until this tab closes or navigates away */ });
+    });
+  });
 }
 
 function el(tag, props = {}, children = []) {
@@ -489,9 +514,21 @@ const RTC = {
   },
 
   send(msg) { if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(msg)); },
-  sendBinary(bytes) { this.dc.send(bytes); },
+  // A disconnect can null out `dc` between pumpChunks()'s per-iteration
+  // teardown check and the actual send — without this guard that races into
+  // a raw TypeError (null deref) instead of the DOMException pumpChunks
+  // already knows how to treat as "stop, connection's gone."
+  sendBinary(bytes) {
+    if (!this.dc) throw new DOMException('Data channel is not open', 'InvalidStateError');
+    this.dc.send(bytes);
+  },
   bufferedAmount() { return this.dc ? this.dc.bufferedAmount : 0; },
-  waitForLowBuffer() { return new Promise((resolve) => this.dc.addEventListener('bufferedamountlow', resolve, { once: true })); },
+  waitForLowBuffer() {
+    return new Promise((resolve, reject) => {
+      if (!this.dc) { reject(new DOMException('Data channel is not open', 'InvalidStateError')); return; }
+      this.dc.addEventListener('bufferedamountlow', resolve, { once: true });
+    });
+  },
 
   teardown() {
     if (this.dc) { try { this.dc.close(); } catch { /* already closed */ } }
@@ -535,8 +572,13 @@ const Transfers = {
       row.needsReselect = null;
       row.writable = null;
       row.file = null;
-      row.chunksSinceCheckpoint = 0;
-      row.lastCheckpointAt = 0;
+      // A fresh page load never has a live writable/connection, so any row
+      // still claiming 'in-progress' from before is stale by definition —
+      // this side's own reload never gets to run its own disconnect
+      // handler, so without this the record would show no action button at
+      // all and resuming would be impossible.
+      if (row.status === 'in-progress') row.status = 'interrupted';
+      if (row.receivedBitmap) row.receivedCount = Protocol.countSet(row.receivedBitmap, row.totalChunks);
       this.byFileId.set(row.fileId, row);
     }
   },
@@ -544,8 +586,8 @@ const Transfers = {
   async persist(record) {
     record.updatedAt = Date.now();
     const {
-      writable, file, awaitingOffer, transferId,
-      chunksSinceCheckpoint, lastCheckpointAt, needsResumeGesture, needsReselect,
+      writable, file, awaitingOffer, transferId, receivedCount,
+      needsResumeGesture, needsReselect,
       _writeQueue, _rateHistory, _bytesPerSec,
       ...toStore
     } = record;
@@ -567,7 +609,9 @@ const Transfers = {
 
   // Recomputes each in-progress record's throughput from a rolling window of
   // recent bytesTransferred samples (rather than a single-tick delta) so the
-  // rate stays stable across the send side's bursty, checkpoint-paced acks.
+  // rate stays stable across the send side's bursty acks. Also where the
+  // receive side pings the sender with progress, now that the writable is
+  // no longer closed periodically to piggyback that on.
   tickRates() {
     const now = Date.now();
     let anyActive = false;
@@ -577,6 +621,12 @@ const Transfers = {
         continue;
       }
       anyActive = true;
+      if (record.direction === 'receive') {
+        RTC.send({
+          type: 'progress', transferId: record.transferId,
+          receivedChunks: record.receivedCount, bytesTransferred: record.bytesTransferred,
+        });
+      }
       record._rateHistory = record._rateHistory || [];
       record._rateHistory.push({ t: now, bytes: record.bytesTransferred });
       const cutoff = now - RATE_WINDOW_MS;
@@ -597,7 +647,6 @@ const Transfers = {
       fileHandle: handle, createdAt: Date.now(), updatedAt: Date.now(),
       transferId: null, file, writable: null, awaitingOffer: false,
       needsResumeGesture: false, needsReselect: null,
-      chunksSinceCheckpoint: 0, lastCheckpointAt: 0,
     };
     this.byFileId.set(fileId, record);
     return record;
@@ -610,12 +659,11 @@ const Transfers = {
         fileId: msg.fileId, peerId, direction: 'receive',
         fileName: msg.name, fileSize: msg.size, mimeType: msg.mimeType,
         chunkSize: msg.chunkSize, totalChunks: msg.totalChunks,
-        receivedBitmap: Protocol.makeBitmap(msg.totalChunks),
+        receivedBitmap: Protocol.makeBitmap(msg.totalChunks), receivedCount: 0,
         bytesTransferred: 0, status: 'offered',
         fileHandle: null, createdAt: Date.now(), updatedAt: Date.now(),
         transferId: null, writable: null, awaitingOffer: false,
         needsResumeGesture: false, needsReselect: null,
-        chunksSinceCheckpoint: 0, lastCheckpointAt: 0,
       };
       this.byFileId.set(record.fileId, record);
     } else {
@@ -650,36 +698,46 @@ const Transfers = {
     if (!record.fileHandle) {
       try { record.fileHandle = await window.showSaveFilePicker({ suggestedName: record.fileName }); }
       catch { return; }
-    } else {
+      await this._tryOpenWritableAndRequest(record);
+      return;
+    }
+    try {
       const granted = await ensurePermission(record.fileHandle, 'readwrite');
       if (!granted) {
         record.needsReselect = 'save';
         UI.renderTransfers();
         return;
       }
+    } catch (err) {
+      await this._handleResumeError(record, err);
+      return;
     }
-    await this._openWritableAndRequest(record);
+    await this._tryOpenWritableAndRequest(record);
   },
 
   async reselectDestination(record) {
     try { record.fileHandle = await window.showSaveFilePicker({ suggestedName: record.fileName }); }
     catch { return; }
     record.needsReselect = null;
-    await this._openWritableAndRequest(record);
+    await this._tryOpenWritableAndRequest(record);
+  },
+
+  async _tryOpenWritableAndRequest(record) {
+    try { await this._openWritableAndRequest(record); }
+    catch (err) { await this._handleResumeError(record, err); }
   },
 
   async _openWritableAndRequest(record) {
     record.writable = await record.fileHandle.createWritable({ keepExistingData: true });
     record.status = 'in-progress';
-    record.lastCheckpointAt = Date.now();
     await this.persist(record);
     UI.renderTransfers();
     const ranges = Protocol.getMissingRanges(record.receivedBitmap, record.totalChunks);
     if (ranges.length === 0) {
-      // Every chunk already landed before the last checkpoint failed to
+      // Every chunk already landed before a previous attempt failed to
       // close/finalize — nothing left to request, just finish the close.
-      try { await this.maybeCheckpoint(record); }
-      catch (err) { await this._handleWriteError(record, err); }
+      // (Caller wraps this whole function in the shared resume-error handler.)
+      await this.finalizeIfComplete(record);
       return;
     }
     RTC.send({ type: 'chunk-request', transferId: record.transferId, ranges });
@@ -697,14 +755,18 @@ const Transfers = {
 
   // ---- send side ----
   async resumeSharing(record) {
-    const granted = await ensurePermission(record.fileHandle, 'read');
-    if (!granted) {
-      record.needsReselect = 'open';
-      UI.renderTransfers();
-      return;
+    try {
+      const granted = await ensurePermission(record.fileHandle, 'read');
+      if (!granted) {
+        record.needsReselect = 'open';
+        UI.renderTransfers();
+        return;
+      }
+      record.file = await record.fileHandle.getFile();
+      await this._afterFileReady(record);
+    } catch (err) {
+      await this._handleResumeError(record, err);
     }
-    record.file = await record.fileHandle.getFile();
-    await this._afterFileReady(record);
   },
 
   async reselectSource(record) {
@@ -760,7 +822,16 @@ const Transfers = {
     record.status = 'in-progress';
     await this.persist(record);
     UI.renderTransfers();
-    await this.pumpChunks(record, msg.ranges);
+    try {
+      await this.pumpChunks(record, msg.ranges);
+    } catch (err) {
+      // The data channel can be torn down mid-pump by a peer disconnect
+      // that's racing this exact send; handleDisconnect already owns
+      // transitioning the record to 'interrupted' when that happens, so
+      // this is just here to stop the pump quietly instead of surfacing an
+      // unhandled rejection.
+      console.warn(`[transfer:warn] send pump for "${record.fileName}" stopped: ${err.message || err}`);
+    }
   },
 
   async pumpChunks(record, ranges) {
@@ -805,12 +876,13 @@ const Transfers = {
     }
   },
 
-  onProgress(msg) {
+  async onProgress(msg) {
     const fileId = this.byTransferId.get(msg.transferId);
     const record = fileId && this.byFileId.get(fileId);
     if (!record) return;
     record.bytesTransferred = msg.bytesTransferred;
     this.logProgress(record, 'ack');
+    await this.persist(record);
     UI.renderTransfers();
   },
 
@@ -832,34 +904,37 @@ const Transfers = {
     const record = fileId && this.byFileId.get(fileId);
     if (!record || record.direction !== 'receive' || !record.writable) return;
     // DataChannel messages arrive as separate events; without this chain, a
-    // fast-arriving chunk could start writing (or a checkpoint could close())
-    // before the previous chunk's write settles. Queue per record so writes
-    // and checkpoint close/reopen cycles never overlap on the same stream.
+    // fast-arriving chunk could start writing before the previous chunk's
+    // write settles, or overlap with the final close() on completion.
+    // Queue per record so writes and that closing close() never overlap.
     record._writeQueue = (record._writeQueue || Promise.resolve())
       .then(() => this._processChunk(record, chunkIndex, payload))
-      .catch((err) => this._handleWriteError(record, err));
+      .catch((err) => this._handleResumeError(record, err));
     await record._writeQueue;
   },
 
-  // write()/close()/createWritable() can fail mid-transfer for reasons
-  // outside our control — e.g. Chrome's Safe Browsing check on close() can
-  // reject writable streams for extensions like .exe, or the OS can
-  // transiently lock the file (AV scan, cloud-sync). Without this, that
-  // rejection would propagate into record._writeQueue and stay rejected
-  // forever: every subsequent .then() on it is skipped, so later chunks are
-  // silently dropped and the transfer looks stuck with no feedback. Instead,
-  // resolve the queue (so future chunks keep flowing) and surface the
-  // failure through the existing "interrupted" / Resume flow.
-  async _handleWriteError(record, err) {
-    console.error(`[transfer:error] write failed for "${record.fileName}"`, err);
+  // Anything in the resume path -- write()/close()/createWritable(), but
+  // also queryPermission()/requestPermission()/getFile() when re-acquiring
+  // access after a reload -- can fail for reasons outside our control (e.g.
+  // Chrome's Safe Browsing check on close() rejecting writable streams for
+  // extensions like .exe, the OS transiently locking the file during an AV
+  // scan, or a permission handle that didn't survive the round trip). Left
+  // unhandled, such a rejection either poisons record._writeQueue (dropping
+  // every later chunk silently) or just freezes whatever UI state was
+  // showing before the click -- both look exactly like "I clicked Resume
+  // and nothing happened." Route all of it through this single recovery so
+  // it always surfaces as an interrupted transfer with a retry button.
+  async _handleResumeError(record, err) {
+    console.error(`[transfer:error] resume failed for "${record.fileName}"`, err);
     try { await record.writable?.close(); } catch { /* stream already broken */ }
     record.writable = null;
-    record.chunksSinceCheckpoint = 0;
     if (record.status === 'in-progress' || record.status === 'offered') record.status = 'interrupted';
+    record.needsResumeGesture = false;
     record._rateHistory = null;
     record._bytesPerSec = 0;
     await this.persist(record);
-    UI.showToast(`${record.fileName}: download interrupted (${err.message || 'write error'}). Click Resume to retry.`);
+    const verb = record.direction === 'send' ? 'upload' : 'download';
+    UI.showToast(`${record.fileName}: ${verb} interrupted (${err.message || 'error'}). Click Resume to retry.`);
     UI.renderTransfers();
   },
 
@@ -869,41 +944,41 @@ const Transfers = {
     if (!Protocol.isChunkSet(record.receivedBitmap, chunkIndex)) {
       Protocol.setChunk(record.receivedBitmap, chunkIndex);
       record.bytesTransferred = Math.min(record.bytesTransferred + payload.byteLength, record.fileSize);
-      record.chunksSinceCheckpoint++;
+      record.receivedCount++;
     }
     UI.renderTransfers();
-    await this.maybeCheckpoint(record);
+    await this.finalizeIfComplete(record);
   },
 
-  async maybeCheckpoint(record) {
-    const now = Date.now();
-    const isComplete = Protocol.countSet(record.receivedBitmap, record.totalChunks) === record.totalChunks;
-    const dueByCount = record.chunksSinceCheckpoint >= CHECKPOINT_CHUNK_INTERVAL;
-    const dueByTime = record.chunksSinceCheckpoint > 0 && (now - record.lastCheckpointAt) >= CHECKPOINT_TIME_INTERVAL_MS;
-    if (!isComplete && !dueByCount && !dueByTime) return;
+  // Closing a writable created with `createWritable({keepExistingData:
+  // true})` and then reopening it copies the *entire* existing file content
+  // into a fresh swap file before any new bytes can be written — a cost
+  // that grows with how much has already landed. Doing that on a periodic
+  // checkpoint (every N chunks / M seconds) turns a single download into
+  // O(bytes^2) of copying and leaves a second full-size copy of the file on
+  // disk for the duration of every checkpoint. So the writable is opened
+  // once per attempt and only ever closed here, once, when every chunk has
+  // actually arrived — never mid-transfer. The tradeoff: an ungraceful
+  // termination (crash, force-kill) loses whatever was written this
+  // attempt, same as an in-progress browser download; a graceful
+  // disconnect or peer reconnect still closes and persists via
+  // handleDisconnect/_handleResumeError.
+  async finalizeIfComplete(record) {
+    if (record.receivedCount !== record.totalChunks) return;
 
     await record.writable.close();
-    record.lastCheckpointAt = now;
-    record.chunksSinceCheckpoint = 0;
-    record.status = isComplete ? 'complete' : 'in-progress';
+    record.status = 'complete';
+    record.writable = null;
+    record._rateHistory = null;
+    record._bytesPerSec = 0;
     await this.persist(record);
     RTC.send({
       type: 'progress', transferId: record.transferId,
-      receivedChunks: Protocol.countSet(record.receivedBitmap, record.totalChunks),
-      bytesTransferred: record.bytesTransferred,
+      receivedChunks: record.receivedCount, bytesTransferred: record.bytesTransferred,
     });
-
-    if (isComplete) {
-      RTC.send({ type: 'transfer-complete', transferId: record.transferId });
-      record.writable = null;
-      record._rateHistory = null;
-      record._bytesPerSec = 0;
-      UI.showToast(`${record.fileName} downloaded successfully.`);
-      this.logProgress(record, 'complete');
-    } else {
-      record.writable = await record.fileHandle.createWritable({ keepExistingData: true });
-      this.logProgress(record, 'checkpoint');
-    }
+    RTC.send({ type: 'transfer-complete', transferId: record.transferId });
+    UI.showToast(`${record.fileName} downloaded successfully.`);
+    this.logProgress(record, 'complete');
     UI.renderTransfers();
   },
 
@@ -1016,6 +1091,15 @@ const UI = {
     document.getElementById('ice-failed-overlay').hidden = true;
     document.getElementById('connect-submit-btn').disabled = false;
     document.getElementById('connection-status').textContent = 'Not connected.';
+  },
+
+  // Shown instead of the whole app when another tab already holds this
+  // identity's lock -- the rest of App.init() never runs in this tab, so no
+  // other UI wiring below matters here.
+  showTabLockBlocked() {
+    document.getElementById('app').hidden = true;
+    document.getElementById('tab-lock-blocked-overlay').hidden = false;
+    document.getElementById('tab-lock-retry-btn').addEventListener('click', () => location.reload());
   },
 
   showConnected(nickname) {
@@ -1132,6 +1216,14 @@ const App = {
 
   async init() {
     Identity.init();
+    // Must happen before anything touches shared state (signaling
+    // registration, IndexedDB, RTC) -- a second tab needs to do nothing
+    // beyond showing the blocked message, not partially initialize.
+    const acquiredLock = await acquireTabLock(`p2p-tab-lock:${Identity.peerId}`);
+    if (!acquiredLock) {
+      UI.showTabLockBlocked();
+      return;
+    }
     await IDB.open();
     await Transfers.loadFromIDB();
     await Peers.loadFromIDB();
