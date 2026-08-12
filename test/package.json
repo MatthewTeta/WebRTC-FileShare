@@ -1,0 +1,13 @@
+{
+  "name": "web-ftp-client-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node repro.test.mjs",
+    "pretest": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}

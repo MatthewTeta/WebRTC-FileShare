@@ -675,6 +675,13 @@ const Transfers = {
     await this.persist(record);
     UI.renderTransfers();
     const ranges = Protocol.getMissingRanges(record.receivedBitmap, record.totalChunks);
+    if (ranges.length === 0) {
+      // Every chunk already landed before the last checkpoint failed to
+      // close/finalize — nothing left to request, just finish the close.
+      try { await this.maybeCheckpoint(record); }
+      catch (err) { await this._handleWriteError(record, err); }
+      return;
+    }
     RTC.send({ type: 'chunk-request', transferId: record.transferId, ranges });
   },
 
@@ -763,7 +770,26 @@ const Transfers = {
       const start = idx * record.chunkSize;
       const end = Math.min(start + record.chunkSize, record.fileSize);
       const bytes = new Uint8Array(await record.file.slice(start, end).arrayBuffer());
-      RTC.sendBinary(Protocol.encodeChunk(record.transferId, idx, bytes));
+      await this.sendWithBackpressure(Protocol.encodeChunk(record.transferId, idx, bytes));
+    }
+  },
+
+  // RTCDataChannel.send() throws synchronously (OperationError, "send queue
+  // is full") once bufferedAmount hits the browser's internal hard cap.
+  // HIGH_WATER only throttles *before* a send, so a chunk that sneaks
+  // through right under the threshold can still push bufferedAmount past
+  // that cap — the next send() then throws. Treat that as backpressure
+  // (wait for room, retry the same chunk) instead of letting it kill the
+  // whole pump loop.
+  async sendWithBackpressure(chunk) {
+    for (;;) {
+      try {
+        RTC.sendBinary(chunk);
+        return;
+      } catch (err) {
+        if (err.name !== 'OperationError') throw err;
+        await RTC.waitForLowBuffer();
+      }
     }
   },
 
@@ -809,10 +835,32 @@ const Transfers = {
     // fast-arriving chunk could start writing (or a checkpoint could close())
     // before the previous chunk's write settles. Queue per record so writes
     // and checkpoint close/reopen cycles never overlap on the same stream.
-    record._writeQueue = (record._writeQueue || Promise.resolve()).then(
-      () => this._processChunk(record, chunkIndex, payload)
-    );
+    record._writeQueue = (record._writeQueue || Promise.resolve())
+      .then(() => this._processChunk(record, chunkIndex, payload))
+      .catch((err) => this._handleWriteError(record, err));
     await record._writeQueue;
+  },
+
+  // write()/close()/createWritable() can fail mid-transfer for reasons
+  // outside our control — e.g. Chrome's Safe Browsing check on close() can
+  // reject writable streams for extensions like .exe, or the OS can
+  // transiently lock the file (AV scan, cloud-sync). Without this, that
+  // rejection would propagate into record._writeQueue and stay rejected
+  // forever: every subsequent .then() on it is skipped, so later chunks are
+  // silently dropped and the transfer looks stuck with no feedback. Instead,
+  // resolve the queue (so future chunks keep flowing) and surface the
+  // failure through the existing "interrupted" / Resume flow.
+  async _handleWriteError(record, err) {
+    console.error(`[transfer:error] write failed for "${record.fileName}"`, err);
+    try { await record.writable?.close(); } catch { /* stream already broken */ }
+    record.writable = null;
+    record.chunksSinceCheckpoint = 0;
+    if (record.status === 'in-progress' || record.status === 'offered') record.status = 'interrupted';
+    record._rateHistory = null;
+    record._bytesPerSec = 0;
+    await this.persist(record);
+    UI.showToast(`${record.fileName}: download interrupted (${err.message || 'write error'}). Click Resume to retry.`);
+    UI.renderTransfers();
   },
 
   async _processChunk(record, chunkIndex, payload) {

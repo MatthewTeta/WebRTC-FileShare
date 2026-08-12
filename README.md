@@ -147,6 +147,17 @@ dialog → fresh code reissued, accept → connected state on both sides,
 invalid/self/busy code errors). That test isn't part of this repo — it was
 a throwaway script, since there's no ongoing test suite here.
 
+`test/` holds one committed regression test (`npm install && npm test` from
+that directory) covering the transfer pipeline itself: it mocks
+`showOpenFilePicker`/`showSaveFilePicker` with in-memory handles (via
+Playwright's `addInitScript`, before any app code runs) so it can drive a
+real pairing → connect → accept → share → download flow over a real
+(loopback) WebRTC DataChannel headlessly, with no native OS dialogs
+involved. It covers two regressions: a large transfer completing without
+stalling on `RTCDataChannel`'s internal send-queue cap, and a mid-transfer
+`write()`/`close()` failure (e.g. Chrome's Safe Browsing check blocking a
+`.exe`) recovering cleanly through the Resume flow instead of hanging.
+
 The file Share/Download/Resume path uses native OS file-picker dialogs
 (`showOpenFilePicker` / `showSaveFilePicker`), which browser automation
 tools can't drive (confirmed: Chromium doesn't route these through the
